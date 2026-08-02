@@ -38,6 +38,25 @@ dequantizes to fp16 first. Full ablation (batching -> +paged KV ->
 +quantization) at c=20: 33.0 -> 48.0 -> 42.0 -> 17.1 tok/s. Biggest honest
 negative result in the project so far. See `benchmarks/results/v0.4_quantization.json`.
 
+## v0.9-streaming
+SSE streaming (`POST /generate_paged_stream`) -- tokens yielded as SSE
+`data:` events the moment they're decoded, verified not buffered (real
+~100-150ms gaps between events). `/generate_paged` kept unchanged as the
+comparison baseline. Cancellation took three attempts before it actually
+worked: racing a fresh `is_disconnected()` per token failed (undetected
+10+s), a persistent watcher task (v0.5's exact working pattern) also
+failed (confirmed via a minimal no-engine repro that this Starlette/uvicorn
+version's `is_disconnected()` never fires against an active streaming
+response as a separately-raced task) -- what worked was awaiting it
+inline in the per-token loop, verified freeing blocks within ~0.85s across
+repeated real curl kills. Verified composition with v0.2 (streaming +
+non-streaming batch together, not serialized) and v0.5 (cancel-mid-stream
+frees blocks) -- 11/11 tests passing. Benchmarks: TTFT improvement over
+non-streaming shrinks from 41.2% (c=10) to 9.5% (c=50) as admission
+queueing dominates; throughput roughly a wash, streaming trailing slightly
+at c=20/50 (37.3-37.5 vs 41.0-41.5 tok/s), plausibly from per-token SSE
+framing overhead. See `benchmarks/results/v0.9_*.json`.
+
 ## v0.8-vllm-comparison
 vLLM comparison, as mandated -- but vLLM could not be run on this machine
 (`pip install vllm` fails to build here, pins torch==2.6.0; vLLM also has

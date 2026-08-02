@@ -1,0 +1,14 @@
+{
+  "note": "streaming TTFT (time to first SSE event, HTTP-observed) vs non-streaming time-to-full-response (HTTP-observed p50 elapsed), same concurrency, same prompt/settings as prior loadtests",
+  "comparison": {
+    "c10": {"nonstream_full_response_p50_s": 7.520, "stream_ttft_p50_s": 4.420, "improvement_pct": 41.2},
+    "c20": {"nonstream_full_response_p50_s": 9.610, "stream_ttft_p50_s": 7.540, "improvement_pct": 21.5},
+    "c50": {"nonstream_full_response_p50_s": 22.217, "stream_ttft_p50_s": 20.114, "improvement_pct": 9.5}
+  },
+  "throughput_tokens_per_s": {
+    "c10": {"stream": 34.38, "nonstream": 33.61},
+    "c20": {"stream": 37.34, "nonstream": 41.47},
+    "c50": {"stream": 37.48, "nonstream": 40.97}
+  },
+  "honest_finding": "Streaming's TTFT advantage over non-streaming is real but shrinks sharply as concurrency grows (41% faster at c=10 down to 9.5% at c=50) -- because max_batch_size=4 means most of TTFT at higher concurrency is admission queueing delay, not generation time, and streaming can't make a request start being processed any sooner, only reveal its first token sooner once it IS being processed. Throughput is roughly a wash at c=10 and slightly lower for streaming at c=20/50 (37.3-37.5 vs 41.0-41.5 tok/s) -- plausible mechanism: per-token SSE framing/flush overhead (json.dumps + HTTP chunk write per token) adds real per-token cost that a single buffered response at the end doesn't pay, though the gap is within a few tok/s and noisier than v0.3/v0.4's negative results."
+}

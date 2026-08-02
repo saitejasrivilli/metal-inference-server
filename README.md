@@ -5,10 +5,10 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.8 — feature-complete.** A continuous-batching, paged-KV,
-quantization-aware, cancellation-safe, multi-model, observable inference
-server for Apple Silicon, with a vLLM comparison that's honest about not
-being apples-to-apples.
+**Status: v0.9 — SSE streaming.** Closes the one gap the v0.8 limitations
+list called out: `/generate_paged_stream` now streams tokens as they're
+generated. Getting cancellation to actually compose with v0.5 took three
+attempts, documented honestly below.
 
 ## TL;DR for recruiters
 
@@ -371,6 +371,87 @@ tradeoffs on hardware none of the mainstream engines support, not claiming
 throughput parity. Full breakdown in
 `benchmarks/results/v0.8_vllm_comparison.json`.
 
+## What's new in v0.9 — SSE streaming
+
+`POST /generate_paged_stream` — new endpoint, `text/event-stream`, yields
+each token as an SSE `data:` event the moment it's decoded.
+`/generate_paged` is unchanged and still non-streaming, kept that way on
+purpose so the v0.1-v0.8 benchmarks stay comparable to a known baseline.
+
+**Why SSE, not WebSocket:** this is one-directional (client sends one
+prompt, server streams tokens back) — no bidirectional channel is ever
+needed, so WebSocket's handshake/framing complexity buys nothing here.
+Same kind of scope call as v0.4's GGUF-vs-PyTorch decision: pick the
+simpler tool that matches the actual shape of the problem.
+
+**Verified not buffered:** real per-token curl timing showed ~100-150ms
+gaps between consecutive SSE events (see the timestamps captured during
+testing) — tokens arrive as they're generated, not dumped at the end.
+
+**Honest negative result — cancellation took three attempts, not one:**
+v0.5 already solved disconnect-detection for the non-streaming path, and
+the obvious assumption was that the same `request.is_disconnected()`
+pattern would just work here too. It didn't, twice:
+1. Racing a *fresh* `is_disconnected()` call against every token: each
+   check got cancelled the instant a token won the race (tokens arrive
+   every ~100-150ms), so it never survived long enough to observe
+   anything. A real curl kill went undetected for 10+ seconds, KV blocks
+   still being consumed the whole time.
+2. Switching to one persistent watcher task — v0.5's *exact* original
+   working pattern — still didn't fix it. A minimal repro with no engine
+   involved at all (plain FastAPI + StreamingResponse) confirmed
+   `request.is_disconnected()` genuinely never flips `True` when raced as
+   a separate task against an active streaming response, in this
+   Starlette/uvicorn version. Not a bug in this project's code.
+3. What actually works: awaiting `is_disconnected()` **inline**, in the
+   same coroutine, directly in the per-token loop — not as a separately
+   scheduled task. Verified over repeated real curl kills: KV blocks freed
+   within ~0.85s every time, consistently. `except GeneratorExit` is kept
+   as a defensive fallback underneath, not the primary mechanism.
+
+Composition, verified rather than assumed:
+- **With v0.5 (cancellation):** `tests/test_v0_9_streaming.py::test_cancel_mid_stream_frees_blocks`
+  — cancelling mid-stream frees blocks, no leak, same guarantee as the
+  non-streaming path.
+- **With v0.2 (batching):** `test_streaming_composes_with_batching_not_serialized`
+  — a streaming and a non-streaming request submitted together both land
+  in the engine's active batch (`len == 2`), confirmed via the same
+  active-request signal the Prometheus gauge is built on, not serialized
+  behind one another.
+
+### Benchmarks — TTFT, streaming vs. non-streaming
+
+Same prompt/settings as prior loadtests, concurrency 10/20/50. Raw JSON in
+`benchmarks/results/v0.9_*.json` and `v0.9_ttft_summary.json`.
+
+| Concurrency | Non-streaming full-response p50 | Streaming TTFT p50 | Improvement |
+|---|---|---|---|
+| 10 | 7.52s | 4.42s | **41.2%** |
+| 20 | 9.61s | 7.54s | 21.5% |
+| 50 | 22.22s | 20.11s | 9.5% |
+
+**Honest finding: the TTFT win shrinks sharply as concurrency grows.**
+`max_batch_size=4` (the same safe default v0.2 measured) means most of
+TTFT at higher concurrency is admission-queueing delay, not generation
+time — streaming can reveal a request's first token sooner *once it's
+being processed*, but can't make it start being processed any sooner. The
+resume-worthy claim here is "41% faster time-to-first-token at
+concurrency=10," not an unqualified "streaming is faster" — it stops being
+much of a win once queueing dominates.
+
+Throughput (tok/s) is close to a wash: 34.4/37.3/37.5 (streaming) vs.
+33.6/41.5/41.0 (non-streaming) at c=10/20/50 — streaming trails slightly at
+c=20/50, plausibly from real per-token SSE framing/flush overhead
+(`json.dumps` + an HTTP chunk write per token) that a single buffered
+response doesn't pay. The gap is smaller and noisier than v0.3/v0.4's
+throughput regressions, reported as-is rather than rounded away.
+
+### Tests
+
+`tests/test_v0_9_streaming.py` — 3/3 passing, real engine and model, no
+mocks: tokens arrive incrementally (not buffered), cancel-mid-stream frees
+blocks, streaming composes with batching. Full suite: 11/11 passing.
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -421,8 +502,6 @@ PYTHONPATH=. python -m pytest tests/ -v   # 8/8, real engine + real model, no mo
   because neither has a fused low-bit/paged-attention Metal kernel behind
   it — that kernel gap is the actual ceiling on this whole project, not
   anything in the Python-level design.
-- No streaming responses (SSE/websocket) — `/generate_paged` returns the
-  full completion once generation finishes, not token-by-token.
 - No persistence — restart the process and all in-flight state is gone
   (acceptable for a benchmarking/demo server, not for production).
 - No GGUF/llama.cpp integration — v0.4's quantization is a from-scratch
@@ -433,6 +512,11 @@ PYTHONPATH=. python -m pytest tests/ -v   # 8/8, real engine + real model, no mo
   CUDA GPU was accessible to this project.
 - Chat-template formatting isn't applied per-model (v0.6's honest finding:
   SmolLM2 is sensitive to this, Qwen isn't).
+- Streaming (v0.9) trails non-streaming slightly on raw throughput at
+  c=20/50 (37.3-37.5 vs 41.0-41.5 tok/s), plausibly from per-token SSE
+  framing overhead — see v0.9's benchmarks section for the real numbers.
+  `/generate_batched` (v0.2) and `/generate_multi` (v0.6) have no
+  streaming variant, only `/generate_paged` does.
 
 ## Roadmap
 
@@ -444,3 +528,4 @@ PYTHONPATH=. python -m pytest tests/ -v   # 8/8, real engine + real model, no mo
 - [x] v0.6 — multi-model router
 - [x] v0.7 — observability + SLO
 - [x] v0.8 — comparison against vLLM (external citation; vLLM not runnable on this machine, see below)
+- [x] v0.9 — SSE streaming

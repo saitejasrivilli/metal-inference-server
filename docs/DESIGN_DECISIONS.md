@@ -161,6 +161,33 @@ every confound that makes it not apples-to-apples (model size, hardware
 tier, kernel maturity, output length) rather than silently normalizing
 those away to make the comparison look tighter than it is.
 
-This is the final entry in this file for the initial v0.1-v0.8 build. Each
-entry above reflects a decision made in the moment it was needed, in the
-order the milestones were built, not smoothed over in hindsight.
+## v0.9 — SSE over WebSocket
+
+One-directional use case: client sends one prompt, server streams tokens
+back. No bidirectional channel is ever needed, so WebSocket's
+handshake/framing complexity would buy nothing here. SSE matches the
+problem's actual shape. Same kind of call as v0.4's GGUF-vs-PyTorch
+decision -- pick the simpler tool that fits, don't reach for the more
+general one by default.
+
+## v0.9 — Inline is_disconnected() instead of a separate watcher task
+
+Cancellation for the streaming endpoint went through three real attempts,
+not one, before it worked -- documented in full in the README's v0.9
+section since it's the milestone's honest finding, not just an
+implementation footnote. The short version for future reference: a
+persistent watcher task racing `request.is_disconnected()` against the
+generation loop is v0.5's exact proven pattern for the non-streaming path,
+and it does NOT work for a streaming response in this Starlette/uvicorn
+version -- confirmed with a minimal no-engine repro, so it's a property of
+the stack, not a bug in this project's code. What works is awaiting
+`is_disconnected()` inline, in the same coroutine, in the per-token loop
+itself. This is worth remembering before assuming any "it worked for path
+A, so the same pattern will work for path B" reasoning in this codebase --
+verify empirically, the way this bug was actually found (by killing a real
+curl connection and watching `/health`), not by pattern-matching to a
+prior fix.
+
+This is the final entry in this file for the v0.1-v0.9 build. Each entry
+above reflects a decision made in the moment it was needed, in the order
+the milestones were built, not smoothed over in hindsight.
