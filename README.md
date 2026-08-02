@@ -5,18 +5,50 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.7 observability + SLO** — Prometheus metrics, OpenTelemetry
-traces, and a burn-rate alert verified to actually fire (and not
-false-positive) in real tests.
+**Status: v0.8 — feature-complete.** A continuous-batching, paged-KV,
+quantization-aware, cancellation-safe, multi-model, observable inference
+server for Apple Silicon, with a vLLM comparison that's honest about not
+being apples-to-apples.
 
-## Architecture (v0.1)
+## TL;DR for recruiters
+
+Built a continuous-batching LLM inference server from scratch for Apple
+Silicon (Metal/MPS) — because no existing engine (vLLM, SGLang) runs on
+Apple GPUs natively. Every number in this README comes from an actual
+measured run on this machine; nothing is estimated. Continuous batching
+gave a real ~1.5x throughput win; paged KV cache traded throughput for
+memory capacity (documented, not spun); naive weight-only quantization
+without a fused low-bit kernel was 5-9x *slower*, the biggest honest
+negative result in the project. Client disconnects correctly free
+in-flight KV cache — a real bug (FastAPI doesn't cancel non-streaming
+handlers on disconnect) was found and fixed while verifying this, not
+assumed away. Two different model architectures are served behind one
+router with isolated queues, verified concurrent. Prometheus metrics, OTel
+traces, and a burn-rate SLO alert are wired in and verified to actually
+fire in tests. vLLM couldn't be run locally (no CUDA on this machine,
+and vLLM has no Apple Silicon support) — that limitation, and a citation
+to public vLLM numbers, are stated plainly rather than glossed over.
+
+## Architecture (current, v0.8)
 
 ```
-client --HTTP--> FastAPI (server/main.py) --> Model (server/model.py) --> torch MPS
+                                   /generate          -> v0.1 single-request path (control group)
+client --HTTP--> FastAPI --+----> /generate_batched   -> v0.2 continuous batching engine
+     (server/main.py)      +----> /generate_paged     -> v0.3-v0.5 paged KV cache + cancellation
+                            +----> /generate_multi     -> v0.6 multi-model router (2 isolated engines)
+                                        |
+                                        v
+                              torch MPS  (Qwen2.5-0.5B-Instruct / SmolLM2-360M-Instruct)
+
+Prometheus /metrics + OTel traces + burn-rate SLO alert (v0.7) instrument
+the request path above; server/quantization.py (v0.4) can be applied to
+either model before it's handed to an engine.
 ```
 
-One request in flight at a time. No queue, no batching, no KV cache reuse
-across requests.
+All four paths run on the same loaded model(s) and are directly
+benchmark-comparable against each other (see each milestone's section
+below) -- that's the whole point of keeping the earlier, "worse" paths
+in the repo instead of deleting them once something better replaced them.
 
 ## How it works
 
@@ -307,6 +339,38 @@ for real against the live server: with `SLO_LATENCY_THRESHOLD_S=0.5` and
 two real ~1.8s requests, `/alerts` showed a fired alert with
 `p99_latency_s: 1.824` within 3 seconds of sending them.
 
+## What's new in v0.8 — comparison against vLLM
+
+**vLLM could not be run on this machine, first-party.** `pip install vllm`
+fails to even build here — it pins `torch==2.6.0`, unavailable for this
+Python/platform — and vLLM has no Apple Silicon/MPS support regardless; it
+targets CUDA/ROCm. No CUDA GPU was accessible in this environment (no
+Colab/cloud GPU access available to this tool either). Rather than skip
+the comparison or fabricate a number, the vLLM side is a citation to a
+public third-party benchmark, explicitly labeled as external and not
+measured by this project.
+
+| | This project (measured) | vLLM (cited, not measured here) |
+|---|---|---|
+| Model | Qwen2.5-0.5B-Instruct | Qwen2.5-3B-Instruct (6x larger) |
+| Hardware | Apple Silicon, unified memory, MPS | NVIDIA A5000, 24GB GDDR6, dedicated |
+| Concurrency 50 throughput | 45.9 tok/s | 2714.88 tok/s total ([source](https://www.databasemart.com/blog/vllm-gpu-benchmark-a5000)) |
+
+**Stated plainly, not spun:** vLLM measured ~59x higher throughput here,
+but that number is not apples-to-apples — different model size (6x),
+different hardware tier (dedicated datacenter/workstation GPU vs. a
+laptop's shared integrated GPU), fused custom CUDA PagedAttention kernels
+vs. this project's own explicitly-non-fused paged KV gather (documented as
+a cost in v0.3), and a longer output length in the cited benchmark. The
+realistic conclusion: a hand-rolled Python serving stack on a laptop GPU,
+running a 6x smaller model, is not competitive with a mature CUDA-native
+engine on a dedicated GPU — that gap is expected, and this project's value
+is demonstrating the serving techniques (batching, paged KV, quantization,
+cancellation, routing, observability) correctly and measuring their real
+tradeoffs on hardware none of the mainstream engines support, not claiming
+throughput parity. Full breakdown in
+`benchmarks/results/v0.8_vllm_comparison.json`.
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -325,18 +389,50 @@ curl -X POST localhost:8000/generate \
   -d '{"prompt": "What is a hash table?", "max_new_tokens": 64}'
 ```
 
-Run the benchmark yourself:
+Try the current endpoints:
 ```bash
-python benchmarks/bench_v0.1_baseline.py
+curl -X POST localhost:8000/generate_paged \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What is a hash table?", "max_new_tokens": 64}'
+
+# multi-model router (opt-in, doubles load time/memory):
+ENABLE_ROUTER=1 uvicorn server.main:app --port 8000
+curl -X POST localhost:8000/generate_multi \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen-0.5b", "prompt": "hello", "max_new_tokens": 32}'
+
+curl localhost:8000/metrics   # Prometheus
+curl localhost:8000/alerts    # fired SLO alerts
 ```
 
-## What this doesn't do yet (v0.1 limitations)
+Run the benchmarks yourself:
+```bash
+python benchmarks/bench_v0.1_baseline.py
+python benchmarks/bench_v0.3_memory.py
+python benchmarks/bench_v0.4_quantization.py
+PYTHONPATH=. python -m pytest tests/ -v   # 8/8, real engine + real model, no mocks
+```
 
-- No concurrent request handling — every request blocks the next.
-- No batching, no paged KV cache, no quantization.
-- No cancellation handling, no multi-model routing, no observability.
-- These land in v0.2 through v0.8 (see roadmap below), each with its own
-  measured benchmark before being called done.
+## What this doesn't do / limitations
+
+- **Quality/throughput tradeoffs aren't free**, and this README doesn't
+  pretend they are: paged KV (v0.3) costs throughput for memory capacity;
+  quantization (v0.4) costs both throughput and some quality for memory,
+  because neither has a fused low-bit/paged-attention Metal kernel behind
+  it — that kernel gap is the actual ceiling on this whole project, not
+  anything in the Python-level design.
+- No streaming responses (SSE/websocket) — `/generate_paged` returns the
+  full completion once generation finishes, not token-by-token.
+- No persistence — restart the process and all in-flight state is gone
+  (acceptable for a benchmarking/demo server, not for production).
+- No GGUF/llama.cpp integration — v0.4's quantization is a from-scratch
+  PyTorch implementation of the same technique, not a llama.cpp dependency
+  (see DESIGN_DECISIONS.md for why).
+- No real trace-storage backend wired up (v0.7 traces export to console).
+- vLLM comparison (v0.8) is a citation, not a first-party measurement — no
+  CUDA GPU was accessible to this project.
+- Chat-template formatting isn't applied per-model (v0.6's honest finding:
+  SmolLM2 is sensitive to this, Qwen isn't).
 
 ## Roadmap
 
@@ -347,4 +443,4 @@ python benchmarks/bench_v0.1_baseline.py
 - [x] v0.5 — cancellation & resource lifecycle
 - [x] v0.6 — multi-model router
 - [x] v0.7 — observability + SLO
-- [ ] v0.8 — comparison against vLLM
+- [x] v0.8 — comparison against vLLM (external citation; vLLM not runnable on this machine, see below)

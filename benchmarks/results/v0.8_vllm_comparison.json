@@ -1,0 +1,30 @@
+{
+  "note": "vLLM could not be run on this machine or measured first-party. Attempted `pip install vllm` and it failed to even build here (pins torch==2.6.0, unavailable for this Python/platform) -- and vLLM has no Apple Silicon/MPS support regardless, it targets CUDA/ROCm. No CUDA GPU was accessible in this environment (no Colab/cloud GPU access available to this tool). The vLLM-side numbers below are therefore NOT measured by this project -- they are cited from a public third-party benchmark, explicitly labeled as external, and are NOT apples-to-apples with the metal-inference-server numbers (different model size, different hardware tier). This is stated plainly rather than implying a comparison that isn't one.",
+  "metal_inference_server": {
+    "source": "measured on this machine, this repo, v0.2 continuous batching",
+    "model": "Qwen2.5-0.5B-Instruct",
+    "hardware": "Apple Silicon (M-series), unified memory, MPS backend",
+    "concurrency_50_throughput_tokens_per_s": 45.9,
+    "raw_result_file": "benchmarks/results/v0.2_batched_bs4_c50.json"
+  },
+  "vllm_external_citation": {
+    "source": "https://www.databasemart.com/blog/vllm-gpu-benchmark-a5000",
+    "source_type": "third-party public benchmark, not run by this project",
+    "model": "Qwen2.5-3B-Instruct",
+    "hardware": "NVIDIA RTX A5000, 24GB GDDR6",
+    "test_conditions": "input 100 tokens, output 600 tokens, fp16",
+    "concurrency_50_total_throughput_tokens_per_s": 2714.88,
+    "concurrency_50_output_throughput_tokens_per_s": 2303.50,
+    "concurrency_300_total_throughput_tokens_per_s": 4601.29
+  },
+  "honest_comparison": {
+    "raw_ratio": "vLLM/A5000 measured ~59x higher total throughput than metal-inference-server/Apple-Silicon at c=50",
+    "confounds_not_controlled_for": [
+      "model size: 3B params (vLLM citation) vs 0.5B params (this project) -- a 6x larger model",
+      "hardware tier: dedicated 24GB datacenter/workstation GPU (A5000, ~27 TFLOPS FP16) vs a laptop's shared unified-memory integrated GPU",
+      "kernel maturity: vLLM's PagedAttention uses fused custom CUDA kernels; this project's paged KV cache (v0.3) explicitly does NOT have a fused kernel and gathers/writes in Python (documented as a throughput cost in v0.3's own results)",
+      "output length: vLLM benchmark used 600-token outputs vs 32-token outputs in this project's throughput runs"
+    ],
+    "conclusion": "This is not an apples-to-apples number and isn't presented as one. The realistic takeaway: a hand-rolled Python serving stack on a laptop's integrated GPU, running a 6x smaller model, is not competitive with a production CUDA kernel stack (vLLM) on a dedicated datacenter GPU -- that gap is expected and reported plainly rather than spun to look closer than it is. The value of this project is demonstrating the serving-systems techniques (continuous batching, paged KV, quantization, cancellation, routing, observability) correctly and measuring their real tradeoffs on hardware none of the mainstream engines support natively, not claiming throughput parity with a mature CUDA-native engine."
+  }
+}

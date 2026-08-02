@@ -38,6 +38,19 @@ dequantizes to fp16 first. Full ablation (batching -> +paged KV ->
 +quantization) at c=20: 33.0 -> 48.0 -> 42.0 -> 17.1 tok/s. Biggest honest
 negative result in the project so far. See `benchmarks/results/v0.4_quantization.json`.
 
+## v0.8-vllm-comparison
+vLLM comparison, as mandated -- but vLLM could not be run on this machine
+(`pip install vllm` fails to build here, pins torch==2.6.0; vLLM also has
+no Apple Silicon/MPS support and no CUDA GPU was accessible in this
+environment). Rather than skip it or invent a number, cites a real public
+third-party benchmark (Qwen2.5-3B-Instruct on an A5000, 45.9 vs 2714.88
+tok/s at c=50) with every confound stated explicitly (6x model size,
+dedicated vs. integrated GPU, fused vs. non-fused kernels, output length)
+so the ~59x gap isn't presented as apples-to-apples. Full breakdown in
+`benchmarks/results/v0.8_vllm_comparison.json`. Final README pass: TL;DR
+block, updated architecture diagram, expanded limitations section. This
+closes out the v0.1-v0.8 build.
+
 ## v0.7-observability
 Prometheus metrics (`GET /metrics`: request counts, latency/TTFT
 histograms, active-request and KV-pool gauges), OpenTelemetry tracing

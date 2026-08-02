@@ -144,5 +144,23 @@ alert nobody trusts. Threshold defaults are read from environment
 variables specifically so this can be tuned per deployment without a code
 change.
 
-More decisions will be appended here as the vLLM comparison milestone gets
-built. This file grows per milestone, not rewritten.
+## v0.8 — External citation instead of a fabricated or skipped vLLM number
+
+The plan made this comparison mandatory. `pip install vllm` was actually
+attempted on this machine and failed at the build-dependency stage (pins
+`torch==2.6.0`, not available for this Python/platform) -- and vLLM
+targets CUDA/ROCm specifically, so it wouldn't run here even if it built;
+there is no Apple Silicon/MPS backend. No CUDA GPU was reachable from this
+environment either (no Colab/cloud GPU access available to this tool).
+Given the hard constraint that no benchmark number in this project may be
+invented, the only honest options were: skip the milestone, or cite a
+real public vLLM benchmark and clearly mark it as external and not
+self-measured. Chose the latter, using a public A5000 benchmark
+(Qwen2.5-3B-Instruct) as the closest available real number, explicit about
+every confound that makes it not apples-to-apples (model size, hardware
+tier, kernel maturity, output length) rather than silently normalizing
+those away to make the comparison look tighter than it is.
+
+This is the final entry in this file for the initial v0.1-v0.8 build. Each
+entry above reflects a decision made in the moment it was needed, in the
+order the milestones were built, not smoothed over in hindsight.
