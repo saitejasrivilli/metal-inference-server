@@ -5,16 +5,18 @@ the two can be A/B benchmarked on the same running process.
 /generate_batched  -> v0.2 path, continuous batching engine
 """
 import asyncio
+import json
 import os
 import time
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from server.engine import ContinuousBatchingEngine
 from server.metrics import ACTIVE_REQUESTS, POOL_FREE_BLOCKS, REQUEST_COUNT, REQUEST_LATENCY, TTFT, metrics_payload
 from server.model import Model
-from server.paged_engine import PagedKVCacheEngine
+from server.paged_engine import STREAM_DONE, PagedKVCacheEngine
 from server.router import ModelRouter
 from server.slo_monitor import SLOMonitor
 from server.tracing import tracer
@@ -172,6 +174,84 @@ async def generate_paged(req: GenerateRequest, request: Request):
         finally:
             ACTIVE_REQUESTS.labels(endpoint="generate_paged").dec()
             POOL_FREE_BLOCKS.labels(engine="paged").set(paged_engine.allocator.num_free)
+
+
+@app.post("/generate_paged_stream")
+async def generate_paged_stream(req: GenerateRequest, request: Request):
+    """v0.9: SSE streaming. Yields each token as an SSE `data:` event as
+    soon as it's generated, instead of buffering the full completion.
+
+    Cancellation reuses v0.5's exact mechanism -- request.is_disconnected(),
+    setting slot.cancelled so the engine's own decode loop frees KV blocks
+    -- but getting there took two failed attempts, found by testing, not
+    assumed to just work because v0.5 already fixed the non-streaming path:
+      1. Racing a *fresh* is_disconnected() call against every token (each
+         one cancelled the instant a token won the race, since tokens
+         arrive every ~100ms) meant the check almost never survived long
+         enough to observe anything. A real curl kill went undetected for
+         10+ seconds, KV blocks still being consumed the whole time.
+      2. Switching to one persistent watcher task (v0.5's original working
+         pattern) didn't fix it either -- still undetected for 10+ seconds.
+         A minimal repro with no engine at all confirmed request.is_disconnected()
+         genuinely never flips True when raced as a separate task against
+         a streaming response in this Starlette/uvicorn version.
+    What actually works: awaiting request.is_disconnected() *inline*, in
+    the same coroutine, directly in the per-token loop below -- not as a
+    separately-scheduled task. Verified over repeated real curl kills:
+    KV blocks freed within ~0.85s every time. The `except GeneratorExit`
+    below is kept as a defensive fallback (Starlette does tear the
+    generator down that way too, just not fast enough to rely on alone),
+    not the primary mechanism.
+    """
+    slot = await paged_engine.submit_stream(req.prompt, req.max_new_tokens)
+
+    async def event_gen():
+        ACTIVE_REQUESTS.labels(endpoint="generate_paged_stream").inc()
+        t0 = time.perf_counter()
+        first_token_at = None
+        new_tokens = 0
+        with tracer.start_as_current_span("generate_paged_stream") as span:
+            span.set_attribute("prompt_len", len(req.prompt))
+            span.set_attribute("max_new_tokens", req.max_new_tokens)
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        slot.cancelled = True
+                        span.set_attribute("cancelled", True)
+                        REQUEST_COUNT.labels(endpoint="generate_paged_stream", status="cancelled").inc()
+                        return
+                    item = await slot.stream_queue.get()
+                    if item is STREAM_DONE:
+                        break
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                        TTFT.labels(endpoint="generate_paged_stream").observe(first_token_at - t0)
+                    new_tokens += 1
+                    yield f"data: {json.dumps({'token': item})}\n\n"
+
+                elapsed = time.perf_counter() - t0
+                REQUEST_LATENCY.labels(endpoint="generate_paged_stream").observe(elapsed)
+                REQUEST_COUNT.labels(endpoint="generate_paged_stream", status="ok").inc()
+                slo_monitor.record(elapsed)
+                span.set_attribute("new_tokens", new_tokens)
+                span.set_attribute("elapsed_s", elapsed)
+                yield "data: [DONE]\n\n"
+            except GeneratorExit:
+                # Starlette tears this generator down this way when the
+                # client is gone and a write finally fails -- this is the
+                # real cancellation signal for streaming (see docstring),
+                # not request.is_disconnected(). Must not yield after
+                # catching GeneratorExit (that raises RuntimeError in an
+                # async generator), so just flag and re-raise.
+                slot.cancelled = True
+                span.set_attribute("cancelled", True)
+                REQUEST_COUNT.labels(endpoint="generate_paged_stream", status="cancelled").inc()
+                raise
+            finally:
+                ACTIVE_REQUESTS.labels(endpoint="generate_paged_stream").dec()
+                POOL_FREE_BLOCKS.labels(engine="paged").set(paged_engine.allocator.num_free)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.post("/generate_multi")

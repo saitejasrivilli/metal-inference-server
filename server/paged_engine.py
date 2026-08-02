@@ -34,6 +34,11 @@ from transformers.cache_utils import DynamicCache
 
 BLOCK_SIZE = 16
 
+# Sentinel pushed onto a slot's stream_queue to signal generation is over
+# (normal finish, rejection, or cancellation) -- distinct from any real
+# decoded token string, including an empty one.
+STREAM_DONE = object()
+
 
 class BlockAllocator:
     def __init__(self, num_blocks: int):
@@ -57,7 +62,7 @@ class PagedSlot:
     __slots__ = (
         "request_id", "token_ids", "prompt_len", "max_new_tokens",
         "block_table", "future", "submit_time", "first_token_time",
-        "cancelled", "freed",
+        "cancelled", "freed", "stream_queue",
     )
 
     def __init__(self, request_id, token_ids, prompt_len, max_new_tokens, future):
@@ -71,6 +76,7 @@ class PagedSlot:
         self.first_token_time = None
         self.cancelled = False
         self.freed = False  # guards against double-freeing blocks
+        self.stream_queue: asyncio.Queue | None = None  # set for streaming requests only
 
     @property
     def seq_len(self):
@@ -131,6 +137,32 @@ class PagedKVCacheEngine:
             slot.cancelled = True
             raise
 
+    async def submit_stream(self, prompt: str, max_new_tokens: int = 128) -> PagedSlot:
+        """v0.9: like submit(), but returns the PagedSlot itself (already
+        queued) instead of awaiting the final result. The caller drives a
+        per-token loop reading slot.stream_queue directly -- that's what
+        lets the HTTP layer race each token against request.is_disconnected()
+        the same way the non-streaming path races the whole request (v0.5),
+        instead of inventing a second, separate cancellation mechanism.
+        """
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        prompt_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"][0].tolist()
+        req_id = uuid.uuid4().hex[:8]
+        slot = PagedSlot(req_id, list(prompt_ids), len(prompt_ids), max_new_tokens, fut)
+        slot.stream_queue = asyncio.Queue()
+        await self.pending.put(slot)
+        return slot
+
+    def _emit_stream_token(self, slot: PagedSlot, token_id: int):
+        if slot.stream_queue is not None:
+            piece = self.tokenizer.decode([token_id], skip_special_tokens=True)
+            slot.stream_queue.put_nowait(piece)
+
+    def _emit_stream_done(self, slot: PagedSlot):
+        if slot.stream_queue is not None:
+            slot.stream_queue.put_nowait(STREAM_DONE)
+
     # -- block table helpers --------------------------------------------
 
     def _blocks_needed(self, num_tokens: int) -> int:
@@ -187,6 +219,7 @@ class PagedKVCacheEngine:
         next_token = torch.argmax(out.logits[0, -1, :]).item()
         slot.token_ids.append(next_token)
         slot.first_token_time = time.perf_counter()
+        self._emit_stream_token(slot, next_token)
         self._check_finished(slot)
 
     def _admit(self):
@@ -195,6 +228,7 @@ class PagedKVCacheEngine:
             if slot.cancelled:
                 # never got past prefill, so no blocks were ever allocated
                 # for it -- nothing to free, just drop it.
+                self._emit_stream_done(slot)
                 continue
             needed = self._blocks_needed(slot.prompt_len)
             if self.allocator.num_free < needed:
@@ -207,6 +241,7 @@ class PagedKVCacheEngine:
         self._free_slot(slot)
         if not slot.future.done():
             slot.future.set_exception(RuntimeError(reason))
+        self._emit_stream_done(slot)
 
     @torch.inference_mode()
     def _decode_step(self):
@@ -228,6 +263,7 @@ class PagedKVCacheEngine:
         for s in self.active:
             if s.cancelled:
                 self._free_slot(s)
+                self._emit_stream_done(s)
             else:
                 still_active.append(s)
         self.active = still_active
@@ -288,6 +324,7 @@ class PagedKVCacheEngine:
             s.token_ids.append(tok)
             if s.first_token_time is None:
                 s.first_token_time = time.perf_counter()
+            self._emit_stream_token(s, tok)
             generated = len(s.token_ids) - s.prompt_len
             if tok == self.eos_id or generated >= s.max_new_tokens:
                 finished.append(i)
@@ -322,6 +359,7 @@ class PagedKVCacheEngine:
         self._free_slot(slot)
         if not slot.future.done():
             slot.future.set_result(result)
+        self._emit_stream_done(slot)
 
     async def _run_forever(self):
         while True:
