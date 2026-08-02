@@ -5,8 +5,9 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.2 continuous batching** — dynamic queue + batch assembly, own
-code, benchmarked against the v0.1 baseline.
+**Status: v0.3 paged KV cache** — real block-based KV cache with actual
+cross-step reuse, benchmarked against v0.2. This is the hardest milestone so
+far and the results are mixed — see below, reported honestly.
 
 ## Architecture (v0.1)
 
@@ -95,6 +96,68 @@ hardware, same decode settings. It also holds up cleanly to c=200, which
 the single-request path was never going to do gracefully (unbounded queued
 connections, not tested at that scale for that reason).
 
+## What's new in v0.3 — paged KV cache
+
+`server/paged_engine.py`: a fixed pool of fixed-size KV blocks
+(block_size=16 tokens), shared across all sequences per layer. Each
+sequence holds a logical block table instead of one growing tensor, and —
+unlike v0.2 — the model only processes the *new* token each decode step;
+past attention is served from the pool. Verified correct by comparing
+token-for-token against a hand-rolled greedy reference loop: exact match,
+32/32 tokens.
+
+**Apple unified memory tradeoff, stated explicitly:** paged allocation
+exists in vLLM/similar because on discrete-GPU hardware, VRAM is small and
+separate from host RAM, so reserving `max_seq_len` per request wastes a
+scarce, expensive tier. On Apple Silicon, CPU and GPU share one physical
+memory pool — there's no separate scarce VRAM tier to protect. The benefit
+paging still provides here is capacity efficiency under one shared budget:
+at the same memory budget as a naive scheme that reserves
+`max_batch_size=4 × max_seq_len=128` (6.29MB) up front, a paged pool with
+the same footprint (32 blocks) can serve roughly **12 concurrent
+short/medium replies** (~40 tokens each) instead of a hard cap of 4 — real
+computed numbers in `benchmarks/results/v0.3_memory_analysis.json`, not
+simulated.
+
+**Honest negative result #1 — paged is slower, not faster, on this
+workload:** at concurrency 20/50, paged KV throughput measured 42.0 / 41.4
+tok/s vs. v0.2's naive recompute-batching at 48.0 / 45.9 tok/s. Root cause:
+the per-token pool write (`_write_kv`) is a pure-Python loop over token
+positions, and the gather-from-blocks step reconstructing a contiguous
+batch tensor each decode step adds real overhead that a fused
+paged-attention kernel (which MPS doesn't have) would eliminate. So the
+architecturally "smarter" cache strategy loses to the "dumber" recompute
+strategy at this scale, on this hardware, with this implementation. This is
+the "friction" this milestone was expected to surface — not smoothed over.
+
+**Honest negative result #2 — mid-decode pool exhaustion silently hung the
+server:** the first version only checked pool capacity at admission time.
+A sequence needs a *new* block at any later decode step too, and that path
+had no capacity check. Reproduced reliably with `num_blocks=6` and 8
+concurrent requests: the unhandled exception killed the background engine
+task with no error surfaced, and every pending request hung forever (not
+even `/health` responded). Fixed by wrapping the per-step allocation in
+try/except and rejecting only the specific request(s) that fail with a
+real 503 error, rather than crashing the shared engine loop. Verified:
+same 6-block/8-request scenario now completes cleanly, 4 succeed and 4 are
+rejected with a clear error instead of hanging. There's no retry/preemption
+queue yet for rejected requests — noted as follow-up, not implemented.
+
+### Benchmarks — paged KV vs. v0.2 batching, same load
+
+| Concurrency | v0.2 batched (bs=4) tok/s | v0.3 paged (bs=4) tok/s |
+|---|---|---|
+| 10 | 5.2* | 36.6* |
+| 20 | 48.0 | 42.0 |
+| 50 | 45.9 | 41.4 |
+
+\* c=10 numbers for both engines are the first run after server start and
+include MPS warmup — not apples-to-apples with c=20/50 (see v0.2 note).
+
+Memory: `benchmarks/bench_v0.3_memory.py` computes exact byte sizes for
+this model's actual config (24 layers, 2 KV heads, head_dim 64, fp16) —
+raw output in `benchmarks/results/v0.3_memory_analysis.json`.
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -130,7 +193,7 @@ python benchmarks/bench_v0.1_baseline.py
 
 - [x] v0.1 — baseline single-request server
 - [x] v0.2 — continuous batching scheduler
-- [ ] v0.3 — paged KV cache
+- [x] v0.3 — paged KV cache
 - [ ] v0.4 — quantization (GGUF Q4_0/Q8_0)
 - [ ] v0.5 — cancellation & resource lifecycle
 - [ ] v0.6 — multi-model router

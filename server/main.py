@@ -7,15 +7,17 @@ the two can be A/B benchmarked on the same running process.
 import asyncio
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from server.engine import ContinuousBatchingEngine
 from server.model import Model
+from server.paged_engine import PagedKVCacheEngine
 
 app = FastAPI(title="metal-inference-server")
 model: Model | None = None
 engine: ContinuousBatchingEngine | None = None
+paged_engine: PagedKVCacheEngine | None = None
 _single_lock = asyncio.Lock()
 
 
@@ -26,7 +28,7 @@ class GenerateRequest(BaseModel):
 
 @app.on_event("startup")
 async def load_model():
-    global model, engine
+    global model, engine, paged_engine
     model = Model()
     # 16 reliably wedges the MPS backend under concurrent load (see
     # docs/DESIGN_DECISIONS.md v0.2 entry) -- 4 is the safe measured default.
@@ -35,6 +37,13 @@ async def load_model():
         model.model, model.tokenizer, model.device, max_batch_size=max_batch_size
     )
     engine.start()
+
+    num_blocks = int(os.environ.get("NUM_KV_BLOCKS", "256"))
+    paged_engine = PagedKVCacheEngine(
+        model.model, model.tokenizer, model.device,
+        num_blocks=num_blocks, max_batch_size=max_batch_size,
+    )
+    paged_engine.start()
 
 
 @app.get("/health")
@@ -60,3 +69,12 @@ async def generate(req: GenerateRequest):
 async def generate_batched(req: GenerateRequest):
     """v0.2 path: submitted into the continuous batching engine."""
     return await engine.submit(req.prompt, req.max_new_tokens)
+
+
+@app.post("/generate_paged")
+async def generate_paged(req: GenerateRequest):
+    """v0.3 path: continuous batching with a real paged KV cache."""
+    try:
+        return await paged_engine.submit(req.prompt, req.max_new_tokens)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))

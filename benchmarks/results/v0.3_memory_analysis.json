@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-08-02T05:17:46.699169+00:00",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "num_layers": 24,
+  "num_kv_heads": 2,
+  "head_dim": 64,
+  "block_size": 16,
+  "paged_pool": {
+    "num_blocks": 256,
+    "reserved_mb": 50.331648,
+    "token_slot_capacity": 4096
+  },
+  "naive_prealloc": {
+    "max_seq_len_128": {
+      "reserved_mb": 6.291456,
+      "max_batch_size": 4
+    },
+    "max_seq_len_256": {
+      "reserved_mb": 12.582912,
+      "max_batch_size": 4
+    },
+    "max_seq_len_512": {
+      "reserved_mb": 25.165824,
+      "max_batch_size": 4
+    }
+  },
+  "same_budget_comparison": {
+    "budget_mb": 6.291456,
+    "naive_fixed_capacity_requests": 4,
+    "paged_blocks_at_same_budget": 32,
+    "paged_token_capacity": 512,
+    "assumed_typical_reply_tokens": 40,
+    "paged_concurrent_capacity_estimate": 12
+  }
+}

@@ -61,7 +61,7 @@ async def run(endpoint: str, concurrency: int, base_url: str):
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--endpoint", required=True, choices=["generate", "generate_batched"])
+    ap.add_argument("--endpoint", required=True, choices=["generate", "generate_batched", "generate_paged"])
     ap.add_argument("--concurrency", type=int, required=True)
     ap.add_argument("--base-url", default="http://localhost:8001")
     ap.add_argument("--out", default=None)

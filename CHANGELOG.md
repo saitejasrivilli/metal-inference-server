@@ -14,3 +14,15 @@ holds up cleanly through concurrency 200 at `max_batch_size=4`.
 Honest negative result: `max_batch_size=16` reliably wedged the MPS backend
 under load (uninterruptible process, needed `kill -9`); reduced to 4.
 See `benchmarks/results/v0.2_*.json`.
+
+## v0.3-paged-kv
+Real paged KV cache (`server/paged_engine.py`) — fixed block pool, actual
+cross-step reuse, verified token-for-token correct against a hand-rolled
+greedy reference (32/32 match). Honest results: throughput at c=20/50 is
+*slower* than v0.2's naive recompute batching (42.0/41.4 vs 48.0/45.9 tok/s)
+due to Python-loop pool writes and no fused MPS paged-attention kernel;
+memory capacity is the real win (~12 concurrent short replies from a budget
+naive prealloc would cap at 4 — see `benchmarks/results/v0.3_memory_analysis.json`).
+Also fixed a real bug: mid-decode pool exhaustion silently hung the entire
+engine; now rejects the specific request(s) with a clean error instead.
+See `benchmarks/results/v0.3_*.json` and `docs/DESIGN_DECISIONS.md`.
