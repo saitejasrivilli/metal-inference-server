@@ -57,6 +57,7 @@ class PagedSlot:
     __slots__ = (
         "request_id", "token_ids", "prompt_len", "max_new_tokens",
         "block_table", "future", "submit_time", "first_token_time",
+        "cancelled", "freed",
     )
 
     def __init__(self, request_id, token_ids, prompt_len, max_new_tokens, future):
@@ -68,6 +69,8 @@ class PagedSlot:
         self.future = future
         self.submit_time = time.perf_counter()
         self.first_token_time = None
+        self.cancelled = False
+        self.freed = False  # guards against double-freeing blocks
 
     @property
     def seq_len(self):
@@ -113,10 +116,20 @@ class PagedKVCacheEngine:
         fut = loop.create_future()
         prompt_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"][0].tolist()
         req_id = uuid.uuid4().hex[:8]
-        await self.pending.put(
-            PagedSlot(req_id, list(prompt_ids), len(prompt_ids), max_new_tokens, fut)
-        )
-        return await fut
+        slot = PagedSlot(req_id, list(prompt_ids), len(prompt_ids), max_new_tokens, fut)
+        await self.pending.put(slot)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            # Client disconnected mid-stream (or the awaiting task was
+            # cancelled for any other reason). The engine loop -- not this
+            # coroutine -- owns the KV blocks, so it has to be the one to
+            # free them; setting a flag here and having _admit/_decode_step
+            # check it every iteration is what actually prevents a leak
+            # instead of just failing this future and abandoning its
+            # blocks forever.
+            slot.cancelled = True
+            raise
 
     # -- block table helpers --------------------------------------------
 
@@ -149,9 +162,12 @@ class PagedKVCacheEngine:
         return k[:up_to], v[:up_to]
 
     def _free_slot(self, slot: PagedSlot):
+        if slot.freed:
+            return  # already freed -- guards against double-free on cancel+finish races
         for b in slot.block_table:
             self.allocator.free_block(b)
         slot.block_table = []
+        slot.freed = True
 
     # -- prefill / decode --------------------------------------------------
 
@@ -176,6 +192,10 @@ class PagedKVCacheEngine:
     def _admit(self):
         while len(self.active) < self.max_batch_size and not self.pending.empty():
             slot = self.pending.get_nowait()
+            if slot.cancelled:
+                # never got past prefill, so no blocks were ever allocated
+                # for it -- nothing to free, just drop it.
+                continue
             needed = self._blocks_needed(slot.prompt_len)
             if self.allocator.num_free < needed:
                 # not enough room for this prompt right now -- try again next round
@@ -200,6 +220,20 @@ class PagedKVCacheEngine:
         # between check and use), so the actual allocation attempt below is
         # wrapped in try/except instead and rejects only the slot(s) that
         # really fail, rather than trying to predict failure in advance.
+        # Free and drop any slot whose client disconnected since the last
+        # step -- checked every step, not just at admission, so a
+        # cancellation is caught within one decode step's latency rather
+        # than only between generations.
+        still_active = []
+        for s in self.active:
+            if s.cancelled:
+                self._free_slot(s)
+            else:
+                still_active.append(s)
+        self.active = still_active
+        if not self.active:
+            return
+
         B = len(self.active)
         lengths = [s.seq_len - 1 for s in self.active]  # tokens already in cache (excludes not-yet-fed last token)
         Lmax = max(lengths)

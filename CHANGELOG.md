@@ -37,3 +37,16 @@ throughput -- no fused low-bit matmul kernel on MPS, so every forward pass
 dequantizes to fp16 first. Full ablation (batching -> +paged KV ->
 +quantization) at c=20: 33.0 -> 48.0 -> 42.0 -> 17.1 tok/s. Biggest honest
 negative result in the project so far. See `benchmarks/results/v0.4_quantization.json`.
+
+## v0.5-cancellation
+Client disconnects now actually free their in-flight KV blocks. Engine-side
+plumbing (`cancelled`/`freed` flags on `PagedSlot`) was necessary but not
+sufficient -- found by manually killing a real curl request that
+FastAPI/Starlette doesn't cancel non-streaming handlers on disconnect at
+all; the generation kept running and holding blocks with nothing detecting
+it. Fixed by racing generation against a `request.is_disconnected()`
+poller in `/generate_paged`. 5/5 tests passing in
+`tests/test_v0_5_cancellation.py` against the real engine (no mocks):
+normal completion, cancel-while-pending, cancel-mid-decode, pool-exhaustion
+rejection, and mixed cancel+completion all fully reclaim the pool with no
+leak or double-free.

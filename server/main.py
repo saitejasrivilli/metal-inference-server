@@ -7,7 +7,7 @@ the two can be A/B benchmarked on the same running process.
 import asyncio
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from server.engine import ContinuousBatchingEngine
@@ -53,6 +53,9 @@ def health():
         "model": model.model_name if model else None,
         "device": model.device if model else None,
         "active_batch_size": len(engine.active) if engine else 0,
+        "paged_active": len(paged_engine.active) if paged_engine else 0,
+        "paged_pool_free_blocks": paged_engine.allocator.num_free if paged_engine else 0,
+        "paged_pool_total_blocks": paged_engine.allocator.num_blocks if paged_engine else 0,
     }
 
 
@@ -72,9 +75,38 @@ async def generate_batched(req: GenerateRequest):
 
 
 @app.post("/generate_paged")
-async def generate_paged(req: GenerateRequest):
-    """v0.3 path: continuous batching with a real paged KV cache."""
+async def generate_paged(req: GenerateRequest, request: Request):
+    """v0.3/v0.5 path: continuous batching with a real paged KV cache.
+
+    FastAPI/Starlette does NOT cancel a non-streaming handler just because
+    the client went away -- confirmed by hand: killing curl mid-request
+    left the generation running to completion server-side and holding its
+    KV blocks the whole time (found while testing this milestone). Disconnect
+    has to be polled explicitly and raced against the generation task, or
+    "cancellation" never actually reaches the engine at all.
+    """
+    async def _watch_disconnect():
+        while not await request.is_disconnected():
+            await asyncio.sleep(0.1)
+
+    gen_task = asyncio.ensure_future(paged_engine.submit(req.prompt, req.max_new_tokens))
+    disconnect_task = asyncio.ensure_future(_watch_disconnect())
+    done, pending = await asyncio.wait(
+        {gen_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if gen_task in done:
+        disconnect_task.cancel()
+        try:
+            return gen_task.result()
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+
+    # client disconnected first -- cancel the in-flight generation so the
+    # engine frees its KV blocks instead of running to completion unseen
+    gen_task.cancel()
     try:
-        return await paged_engine.submit(req.prompt, req.max_new_tokens)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        await gen_task
+    except asyncio.CancelledError:
+        pass
+    return None

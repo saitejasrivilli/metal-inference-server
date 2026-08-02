@@ -1,6 +1,8 @@
 accelerate==1.14.0
 fastapi==0.141.1
+httpx==0.28.1
+pytest-asyncio==1.4.0
+pytest==9.1.1
 torch==2.13.0
 transformers==5.14.1
 uvicorn==0.52.1
-httpx==0.28.1

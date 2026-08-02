@@ -5,9 +5,9 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.4 quantization** — Q8_0/Q4_0-style weight-only quantization,
-benchmarked against v0.1-v0.3. Biggest honest negative result in the
-project so far — see below.
+**Status: v0.5 cancellation & resource lifecycle** — client disconnects now
+actually free their KV blocks. Found and fixed a real bug in the process:
+see below.
 
 ## Architecture (v0.1)
 
@@ -213,6 +213,45 @@ not a free win, and shouldn't be read as "quantization is bad," just "naive
 weight-only quantization without a matching compute kernel is a memory-only
 lever on this hardware."
 
+## What's new in v0.5 — cancellation & resource lifecycle
+
+Client disconnects mid-generation now free their in-flight KV blocks
+instead of running to completion unseen. Two layers had to change:
+
+**Engine layer (`server/paged_engine.py`):** `PagedSlot` gained a
+`cancelled` flag. `submit()` catches `asyncio.CancelledError` around
+`await fut` and sets the flag; `_admit()` drops still-pending cancelled
+requests before they ever allocate a block, and `_decode_step()` checks
+every active slot's flag at the top of each step and frees its blocks
+immediately rather than continuing to generate for it. `_free_slot()`
+gained a `freed` guard so a slot can never be double-freed if it's
+cancelled and finishes in the same window.
+
+**Honest bug found while testing this milestone, not before shipping it:**
+the first version only implemented the engine-side plumbing above and
+called it done. Manually killing a real `curl` request mid-stream against
+the running server proved that did *nothing* — FastAPI/Starlette does not
+cancel a non-streaming request handler just because the client went away;
+the handler runs to completion regardless, holding its KV blocks the whole
+time (`paged_active: 1`, blocks not returned, confirmed via `/health`
+before the fix). `/generate_paged` now explicitly races the generation
+task against a polling `request.is_disconnected()` watcher and cancels the
+generation the moment a disconnect is detected. Re-tested the same
+kill-mid-request scenario after the fix: pool returns to
+`paged_pool_free_blocks: 256/256` within one poll interval. This is the
+kind of gap that's invisible in a unit test that only calls
+`task.cancel()` directly — it only shows up by actually disconnecting a
+real HTTP client.
+
+### Tests
+
+`tests/test_v0_5_cancellation.py` — 5/5 passing, against the real engine
+and real model (no mocks): normal completion frees all blocks; cancelling
+a still-queued (pre-prefill) request leaks nothing; cancelling mid-decode
+frees blocks within one step; pool-exhaustion rejection frees cleanly with
+no double-free; and a mixed cancel+completion batch fully reclaims the
+pool.
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -250,7 +289,7 @@ python benchmarks/bench_v0.1_baseline.py
 - [x] v0.2 — continuous batching scheduler
 - [x] v0.3 — paged KV cache
 - [x] v0.4 — quantization (Q4_0/Q8_0-style, PyTorch weight-only; see scope note)
-- [ ] v0.5 — cancellation & resource lifecycle
+- [x] v0.5 — cancellation & resource lifecycle
 - [ ] v0.6 — multi-model router
 - [ ] v0.7 — observability + SLO
 - [ ] v0.8 — comparison against vLLM

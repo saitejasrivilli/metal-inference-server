@@ -93,6 +93,21 @@ kernels do integer matmul natively; that's specifically what wasn't
 reimplemented here. Documented as a property of this implementation, not a
 general claim about quantization.
 
-More decisions will be appended here as later milestones (cancellation
-lifecycle, multi-model routing) get built. This file grows per milestone,
-not rewritten.
+## v0.5 — Explicit disconnect polling instead of relying on request cancellation
+
+Assumed initially that a client disconnecting mid-request would cancel the
+FastAPI handler coroutine automatically, the same way it works for many
+streaming frameworks. Verified by hand that it doesn't: Starlette does not
+tear down a non-streaming endpoint just because the client's socket closed
+-- confirmed by killing a real `curl` request against the running server
+and watching `/health` show the KV blocks still held, generation still
+running, after the client was long gone. Fixed by racing the generation
+task against a coroutine that polls `request.is_disconnected()` every
+100ms and cancels the generation task the moment it flips. The 100ms poll
+interval is a real, small, deliberate latency cost on detecting
+disconnects -- not free, but bounded and predictable, versus the
+alternative of no detection at all.
+
+More decisions will be appended here as later milestones (multi-model
+routing, observability) get built. This file grows per milestone, not
+rewritten.
