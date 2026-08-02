@@ -26,3 +26,14 @@ naive prealloc would cap at 4 — see `benchmarks/results/v0.3_memory_analysis.j
 Also fixed a real bug: mid-decode pool exhaustion silently hung the entire
 engine; now rejects the specific request(s) with a clean error instead.
 See `benchmarks/results/v0.3_*.json` and `docs/DESIGN_DECISIONS.md`.
+
+## v0.4-quantization
+Weight-only Q8_0 (int8) / Q4_0 (packed int4) quantization
+(`server/quantization.py`) applied directly to the loaded PyTorch model —
+scoped away from GGUF/llama.cpp since that runtime doesn't expose the
+`DynamicCache` API v0.2/v0.3's engines depend on (see DESIGN_DECISIONS.md).
+Real 2.0x/4.0x memory compression, but 5.2x/9.1x *slower* single-request
+throughput -- no fused low-bit matmul kernel on MPS, so every forward pass
+dequantizes to fp16 first. Full ablation (batching -> +paged KV ->
++quantization) at c=20: 33.0 -> 48.0 -> 42.0 -> 17.1 tok/s. Biggest honest
+negative result in the project so far. See `benchmarks/results/v0.4_quantization.json`.

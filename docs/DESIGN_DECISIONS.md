@@ -68,6 +68,31 @@ advantage, but is not a throughput win in this implementation on this
 hardware at these scales. That's reported as-is rather than reframed to
 look like an unambiguous improvement.
 
-More decisions will be appended here as later milestones (quantization,
-cancellation lifecycle, multi-model routing) get built. This file grows
-per milestone, not rewritten.
+## v0.4 — PyTorch weight-only quantization instead of GGUF/llama.cpp
+
+The plan specified GGUF conversion via llama.cpp. Decided against it after
+confirming the mismatch is structural, not just extra work: llama.cpp is a
+separate C++/GGML runtime with its own KV-cache representation, and
+`server/engine.py`/`server/paged_engine.py` are built directly against
+`transformers`' `DynamicCache`/`past_key_values` API. Pointing the existing
+engines at a `.gguf` model would mean re-implementing both against
+llama.cpp's bindings, not swapping a file format — effectively a second
+serving stack. Instead, implemented the same technique GGUF's Q8_0/Q4_0
+formats use (per-channel integer weights + scale) directly on the loaded
+PyTorch model (`server/quantization.py`), so quantization's actual
+memory/throughput/quality tradeoff could be measured inside the same
+engines every other milestone uses, rather than as a disconnected side
+experiment.
+
+Tradeoff this surfaced: without a fused int8/int4 matmul kernel (MPS has
+none), weight-only quantization here dequantizes to fp16 every forward
+pass. Measured 2.0x/4.0x memory compression at Q8_0/Q4_0, but 5.2x/9.1x
+*slower* single-request throughput — the dequant cost dominates. A real
+llama.cpp deployment would not show this regression, since its Q4_0/Q8_0
+kernels do integer matmul natively; that's specifically what wasn't
+reimplemented here. Documented as a property of this implementation, not a
+general claim about quantization.
+
+More decisions will be appended here as later milestones (cancellation
+lifecycle, multi-model routing) get built. This file grows per milestone,
+not rewritten.

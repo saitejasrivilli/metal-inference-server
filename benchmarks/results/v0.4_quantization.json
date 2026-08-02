@@ -1,0 +1,42 @@
+{
+  "timestamp": "2026-08-02T05:21:19.933801+00:00",
+  "max_new_tokens": 32,
+  "fp16_single_request": {
+    "bits": null,
+    "num_linear_replaced": null,
+    "orig_weight_mb": null,
+    "quant_weight_mb": null,
+    "compression_ratio": 1.0,
+    "mean_tokens_per_sec": 35.91200504373224,
+    "sample_text": " A hash table is an associative array that uses a hash function to map keys to their corresponding values, allowing for efficient storage and retrieval of data elements."
+  },
+  "q8_0_single_request": {
+    "bits": 8,
+    "num_linear_replaced": 168,
+    "orig_weight_mb": 715.65312,
+    "quant_weight_mb": 358.434816,
+    "compression_ratio": 1.9966060439842988,
+    "mean_tokens_per_sec": 6.884744229225187,
+    "sample_text": " A hash table is an associative array data structure that uses a hash function to map keys to their corresponding values, allowing for efficient storage and retrieval of elements based on"
+  },
+  "q4_0_single_request": {
+    "bits": 4,
+    "num_linear_replaced": 168,
+    "orig_weight_mb": 715.65312,
+    "quant_weight_mb": 179.521536,
+    "compression_ratio": 3.9864471747835313,
+    "mean_tokens_per_sec": 3.929595438664329,
+    "sample_text": " A hash table, also known as a \"key\" table, is a data structure that uses the key-value pair to map elements into an array of buckets.\n"
+  },
+  "q8_0_paged_concurrency_20": {
+    "concurrency": 20,
+    "wall_s": 37.53484624999692,
+    "throughput_tokens_per_s": 17.050822474064418
+  },
+  "ablation_c20_tokens_per_sec": {
+    "single_request_no_batching_v0.1_v0.2baseline": 33.0,
+    "plus_continuous_batching_v0.2": 48.0,
+    "plus_paged_kv_v0.3": 42.0,
+    "plus_quantization_q8_0_v0.4": 17.050822474064418
+  }
+}

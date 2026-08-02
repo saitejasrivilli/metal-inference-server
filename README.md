@@ -5,9 +5,9 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.3 paged KV cache** — real block-based KV cache with actual
-cross-step reuse, benchmarked against v0.2. This is the hardest milestone so
-far and the results are mixed — see below, reported honestly.
+**Status: v0.4 quantization** — Q8_0/Q4_0-style weight-only quantization,
+benchmarked against v0.1-v0.3. Biggest honest negative result in the
+project so far — see below.
 
 ## Architecture (v0.1)
 
@@ -158,6 +158,61 @@ Memory: `benchmarks/bench_v0.3_memory.py` computes exact byte sizes for
 this model's actual config (24 layers, 2 KV heads, head_dim 64, fp16) —
 raw output in `benchmarks/results/v0.3_memory_analysis.json`.
 
+## What's new in v0.4 — quantization (Q8_0/Q4_0-style)
+
+**Scope decision, stated up front:** the plan called for GGUF conversion
+via llama.cpp. llama.cpp is a separate C++/GGML runtime with its own
+forward pass and KV-cache representation — it doesn't expose the
+`past_key_values`/`DynamicCache` hooks `server/paged_engine.py` and
+`server/engine.py` are built on, so pointing them at a `.gguf` file would
+mean rewriting both engines against a different API, not adding a format.
+Instead, `server/quantization.py` implements the same *technique* GGUF's
+Q8_0 (int8) and Q4_0 (packed int4) use — per-output-channel scale + integer
+weights — directly on the loaded PyTorch model, so it drops into the exact
+same engines everything else in this repo runs on, and its effect is
+measured in the same harness as every other milestone.
+
+**Honest negative result (the biggest one in this project so far):**
+weight-only quantization here is a pure memory optimization, not a speed
+one — because MPS has no int8/int4 matmul kernel, every forward pass
+dequantizes the weights back to fp16 first. Measured on this machine,
+single-request, greedy, 32 tokens:
+
+| Config | Weight memory | Compression | tok/s | vs fp16 |
+|---|---|---|---|---|
+| fp16 baseline | 715.7 MB | 1.0x | 35.9 | — |
+| Q8_0 (int8) | 358.4 MB | 2.00x | 6.9 | **5.2x slower** |
+| Q4_0 (packed int4) | 179.5 MB | 3.99x | 3.9 | **9.1x slower** |
+
+Quality holds up reasonably at Q8_0 (coherent, on-topic), degrades
+noticeably at Q4_0 (grammatically off, trails into a stray newline) — see
+`sample_text` in `benchmarks/results/v0.4_quantization.json`. The memory
+compression numbers are exactly what Q8_0/Q4_0 promise (2x / ~4x). The
+throughput numbers are not what a real GGUF/llama.cpp deployment would
+show — llama.cpp's Q4_0/Q8_0 kernels do integer matmul natively; this
+from-scratch PyTorch implementation dequantizes-then-matmuls, and that
+dequant step is the entire cost. This is reported as a finding about *this
+implementation*, not a verdict on quantization as a technique.
+
+### Ablation table — isolating each optimization's contribution
+
+Same prompt, same hardware, concurrency=20, tokens/sec:
+
+| Configuration | tok/s | Delta |
+|---|---|---|
+| Single-request, no batching (v0.1/v0.2 baseline) | 33.0 | — |
+| + continuous batching (v0.2) | 48.0 | +45% |
+| + paged KV cache (v0.3) | 42.0 | -13% vs batching alone |
+| + quantization, Q8_0 (v0.4) | 17.1 | -59% vs paged KV |
+
+Batching is the only lever that was an unambiguous win in this project.
+Paged KV traded throughput for memory capacity (see v0.3). Quantization, as
+implemented here without a fused low-bit kernel, traded both throughput and
+some quality for memory — the isolation makes clear it's the memory lever,
+not a free win, and shouldn't be read as "quantization is bad," just "naive
+weight-only quantization without a matching compute kernel is a memory-only
+lever on this hardware."
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -194,7 +249,7 @@ python benchmarks/bench_v0.1_baseline.py
 - [x] v0.1 — baseline single-request server
 - [x] v0.2 — continuous batching scheduler
 - [x] v0.3 — paged KV cache
-- [ ] v0.4 — quantization (GGUF Q4_0/Q8_0)
+- [x] v0.4 — quantization (Q4_0/Q8_0-style, PyTorch weight-only; see scope note)
 - [ ] v0.5 — cancellation & resource lifecycle
 - [ ] v0.6 — multi-model router
 - [ ] v0.7 — observability + SLO
