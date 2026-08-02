@@ -5,9 +5,9 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.5 cancellation & resource lifecycle** — client disconnects now
-actually free their KV blocks. Found and fixed a real bug in the process:
-see below.
+**Status: v0.6 multi-model router** — two different model architectures
+served behind one endpoint, isolated queues and memory, verified concurrent
+and independent.
 
 ## Architecture (v0.1)
 
@@ -252,6 +252,34 @@ frees blocks within one step; pool-exhaustion rejection frees cleanly with
 no double-free; and a mixed cancel+completion batch fully reclaims the
 pool.
 
+## What's new in v0.6 — multi-model router
+
+`server/router.py`: serves two genuinely different models behind one
+`/generate_multi` endpoint (pick with `{"model": "qwen-0.5b" | "smollm2-360m", ...}`)
+— `Qwen/Qwen2.5-0.5B-Instruct` (24 layers, 2 KV heads) and
+`HuggingFaceTB/SmolLM2-360M-Instruct` (32 layers, 5 KV heads), a different
+architecture entirely, not just a different size of the same family. Each
+model gets its own `Model` instance, own `PagedKVCacheEngine`, own paged KV
+pool, own background decode loop — fully isolated, not a shared pool split
+at request time (see DESIGN_DECISIONS.md for the tradeoff). Opt-in via
+`ENABLE_ROUTER=1` since it doubles load time and memory.
+
+**Verified, not assumed, that isolation is real:** fired one request at
+each model simultaneously and measured wall-clock — Qwen's request
+completed in ~1.72s and SmolLM2's in ~0.39s, each close to its own
+solo-request time, confirming independent per-model queues rather than one
+shared queue serializing them. Combined weight footprint measured directly:
+988.1 MB + 723.6 MB = 1711.7 MB for both loaded at once — real numbers in
+`benchmarks/results/v0.6_router.json`.
+
+**Honest finding, not a router bug:** SmolLM2-360M-Instruct returns an
+almost-empty completion (`new_tokens: 1`, immediate EOS) on the same raw,
+non-chat-templated prompt format Qwen tolerates fine. Reproduced calling
+SmolLM2 directly, outside the router, so it's a property of that model's
+sensitivity to prompt formatting, not something the routing layer broke.
+This repo doesn't apply per-model chat templates yet — noted as a real gap
+rather than papered over with a cherry-picked prompt.
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -290,6 +318,6 @@ python benchmarks/bench_v0.1_baseline.py
 - [x] v0.3 — paged KV cache
 - [x] v0.4 — quantization (Q4_0/Q8_0-style, PyTorch weight-only; see scope note)
 - [x] v0.5 — cancellation & resource lifecycle
-- [ ] v0.6 — multi-model router
+- [x] v0.6 — multi-model router
 - [ ] v0.7 — observability + SLO
 - [ ] v0.8 — comparison against vLLM

@@ -38,6 +38,18 @@ dequantizes to fp16 first. Full ablation (batching -> +paged KV ->
 +quantization) at c=20: 33.0 -> 48.0 -> 42.0 -> 17.1 tok/s. Biggest honest
 negative result in the project so far. See `benchmarks/results/v0.4_quantization.json`.
 
+## v0.6-router
+Multi-model router (`server/router.py`) -- two genuinely different
+architectures (Qwen2.5-0.5B, 24L/2KV-heads; SmolLM2-360M, 32L/5KV-heads)
+behind one `/generate_multi` endpoint, isolated queues/pools/decode loops
+per model. Verified concurrent isolation by firing simultaneous requests at
+both and confirming each completed in ~its own solo time (1.72s / 0.39s),
+not serialized. Combined weight footprint measured directly: 1711.7 MB for
+both loaded at once. Honest finding: SmolLM2 returns near-empty output on
+raw (non-chat-templated) prompts Qwen tolerates fine -- a model-sensitivity
+property, reproduced outside the router, not a routing bug.
+See `benchmarks/results/v0.6_router.json`.
+
 ## v0.5-cancellation
 Client disconnects now actually free their in-flight KV blocks. Engine-side
 plumbing (`cancelled`/`freed` flags on `PagedSlot`) was necessary but not

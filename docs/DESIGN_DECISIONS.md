@@ -108,6 +108,18 @@ interval is a real, small, deliberate latency cost on detecting
 disconnects -- not free, but bounded and predictable, versus the
 alternative of no detection at all.
 
-More decisions will be appended here as later milestones (multi-model
-routing, observability) get built. This file grows per milestone, not
-rewritten.
+## v0.6 — Isolated per-model memory budgets instead of one shared pool
+
+Each routed model gets its own fixed-size paged KV pool rather than all
+models sharing one pool split dynamically at request time. Simpler and
+safer: an isolated budget can't be starved by another model's traffic, and
+there's no cross-model fairness policy to get wrong. Tradeoff: each model
+reserves its own memory whether it's busy or completely idle, so total
+memory scales with number of models loaded, not with actual combined load
+-- on constrained hardware (11GB free disk observed on this machine while
+building this milestone) that ceiling matters, and picking a genuinely
+small second model (SmolLM2-360M, ~724MB) instead of a large one was a
+direct consequence of that constraint, not an arbitrary choice.
+
+More decisions will be appended here as later milestones (observability,
+vLLM comparison) get built. This file grows per milestone, not rewritten.

@@ -1,0 +1,15 @@
+{
+  "models": {
+    "qwen-0.5b": {"hf_name": "Qwen/Qwen2.5-0.5B-Instruct", "weight_mb": 988.1},
+    "smollm2-360m": {"hf_name": "HuggingFaceTB/SmolLM2-360M-Instruct", "weight_mb": 723.6}
+  },
+  "combined_weight_mb": 1711.7,
+  "router_blocks_per_model": 64,
+  "concurrent_isolation_test": {
+    "qwen-0.5b_elapsed_s": 1.722,
+    "smollm2-360m_elapsed_s": 0.394,
+    "both_fired_simultaneously": true,
+    "note": "each model's request completed in roughly its own solo-request time, confirming independent per-model queues rather than serialization behind one shared queue"
+  },
+  "honest_finding": "SmolLM2-360M-Instruct returns near-empty output (immediate EOS, new_tokens=1) on a raw non-chat-templated prompt, while Qwen2.5-0.5B-Instruct tolerates the same raw prompt format fine. Not a router bug -- confirmed by testing SmolLM2 directly outside the router. Different instruct models have different sensitivity to chat-template formatting; this repo does not apply per-model chat templates yet."
+}

@@ -13,11 +13,13 @@ from pydantic import BaseModel
 from server.engine import ContinuousBatchingEngine
 from server.model import Model
 from server.paged_engine import PagedKVCacheEngine
+from server.router import ModelRouter
 
 app = FastAPI(title="metal-inference-server")
 model: Model | None = None
 engine: ContinuousBatchingEngine | None = None
 paged_engine: PagedKVCacheEngine | None = None
+router: ModelRouter | None = None
 _single_lock = asyncio.Lock()
 
 
@@ -26,9 +28,15 @@ class GenerateRequest(BaseModel):
     max_new_tokens: int = 128
 
 
+class RoutedGenerateRequest(BaseModel):
+    model: str
+    prompt: str
+    max_new_tokens: int = 128
+
+
 @app.on_event("startup")
 async def load_model():
-    global model, engine, paged_engine
+    global model, engine, paged_engine, router
     model = Model()
     # 16 reliably wedges the MPS backend under concurrent load (see
     # docs/DESIGN_DECISIONS.md v0.2 entry) -- 4 is the safe measured default.
@@ -45,6 +53,13 @@ async def load_model():
     )
     paged_engine.start()
 
+    if os.environ.get("ENABLE_ROUTER", "0") == "1":
+        router = ModelRouter(
+            num_blocks_per_model=int(os.environ.get("ROUTER_BLOCKS_PER_MODEL", "128")),
+            max_batch_size=max_batch_size,
+        )
+        router.start()
+
 
 @app.get("/health")
 def health():
@@ -56,6 +71,7 @@ def health():
         "paged_active": len(paged_engine.active) if paged_engine else 0,
         "paged_pool_free_blocks": paged_engine.allocator.num_free if paged_engine else 0,
         "paged_pool_total_blocks": paged_engine.allocator.num_blocks if paged_engine else 0,
+        "router": router.health() if router else None,
     }
 
 
@@ -110,3 +126,17 @@ async def generate_paged(req: GenerateRequest, request: Request):
     except asyncio.CancelledError:
         pass
     return None
+
+
+@app.post("/generate_multi")
+async def generate_multi(req: RoutedGenerateRequest):
+    """v0.6 path: routes to one of several models, each with its own
+    engine, KV pool, and queue -- serving platform, not single-model demo."""
+    if router is None:
+        raise HTTPException(status_code=503, detail="router disabled (set ENABLE_ROUTER=1)")
+    try:
+        return await router.submit(req.model, req.prompt, req.max_new_tokens)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
