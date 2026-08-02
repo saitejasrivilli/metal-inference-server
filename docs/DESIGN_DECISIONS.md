@@ -121,5 +121,28 @@ building this milestone) that ceiling matters, and picking a genuinely
 small second model (SmolLM2-360M, ~724MB) instead of a large one was a
 direct consequence of that constraint, not an arbitrary choice.
 
-More decisions will be appended here as later milestones (observability,
-vLLM comparison) get built. This file grows per milestone, not rewritten.
+## v0.7 — Console span exporter instead of a real tracing backend
+
+Chose `ConsoleSpanExporter` over standing up Jaeger/Tempo/an OTLP
+collector. The milestone's actual claim is "spans exist, with the right
+structure, around the real request path" -- that's fully verifiable with a
+console exporter, and adding a whole trace-storage service would be
+infrastructure weight without changing what's being demonstrated. The
+instrumentation (`tracer.start_as_current_span`, attributes) is exporter-
+agnostic; swapping in `OTLPSpanExporter` for a real backend is a one-line
+change if this were going into an actual deployment.
+
+## v0.7 — Sustained-breach burn rate instead of single-sample alerting
+
+The SLO monitor requires several consecutive check-cycle breaches before
+firing, not just one slow request crossing the threshold. Verified this
+matters with a dedicated test
+(`test_single_slow_request_does_not_fire_alone`): a single spike among
+otherwise healthy latencies must not fire the alert, exactly because a
+burn-rate alert that pages on every individual slow request is a burn-rate
+alert nobody trusts. Threshold defaults are read from environment
+variables specifically so this can be tuned per deployment without a code
+change.
+
+More decisions will be appended here as the vLLM comparison milestone gets
+built. This file grows per milestone, not rewritten.

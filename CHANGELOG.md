@@ -38,6 +38,18 @@ dequantizes to fp16 first. Full ablation (batching -> +paged KV ->
 +quantization) at c=20: 33.0 -> 48.0 -> 42.0 -> 17.1 tok/s. Biggest honest
 negative result in the project so far. See `benchmarks/results/v0.4_quantization.json`.
 
+## v0.7-observability
+Prometheus metrics (`GET /metrics`: request counts, latency/TTFT
+histograms, active-request and KV-pool gauges), OpenTelemetry tracing
+(console exporter, one span per `/generate_paged` call), and a burn-rate
+SLO monitor (`server/slo_monitor.py`, `GET /alerts`). Alert verified to
+actually fire in tests (3/3 passing,
+`tests/test_v0_7_slo_monitor.py`): sustained breach fires, healthy
+latencies never fire, and a single slow request among healthy ones does
+NOT fire alone. Also fired for real against the live server
+(`SLO_LATENCY_THRESHOLD_S=0.5`, two real ~1.8s requests -> alert with
+`p99_latency_s: 1.824` within 3s).
+
 ## v0.6-router
 Multi-model router (`server/router.py`) -- two genuinely different
 architectures (Qwen2.5-0.5B, 24L/2KV-heads; SmolLM2-360M, 32L/5KV-heads)

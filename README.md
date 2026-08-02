@@ -5,9 +5,9 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.6 multi-model router** — two different model architectures
-served behind one endpoint, isolated queues and memory, verified concurrent
-and independent.
+**Status: v0.7 observability + SLO** — Prometheus metrics, OpenTelemetry
+traces, and a burn-rate alert verified to actually fire (and not
+false-positive) in real tests.
 
 ## Architecture (v0.1)
 
@@ -280,6 +280,33 @@ sensitivity to prompt formatting, not something the routing layer broke.
 This repo doesn't apply per-model chat templates yet — noted as a real gap
 rather than papered over with a cherry-picked prompt.
 
+## What's new in v0.7 — observability + SLO
+
+- `GET /metrics` — Prometheus text format: request counts by status,
+  request-latency and TTFT histograms, active-request and KV-pool-free
+  gauges (`server/metrics.py`).
+- OpenTelemetry tracing (`server/tracing.py`) — a span per `/generate_paged`
+  call with `prompt_len`/`max_new_tokens`/`new_tokens`/`elapsed_s`
+  attributes. **Scope note:** exported to the console, not a real
+  trace-storage backend (Jaeger/Tempo/an OTLP collector) — standing up a
+  trace-storage service wasn't the point of this milestone; verifying
+  spans exist with the right structure around the real request path was.
+  Swapping in `OTLPSpanExporter` for a real collector is a one-line change.
+- `server/slo_monitor.py` — a burn-rate SLO monitor: tracks a rolling
+  window of real request latencies, and fires an alert only when p99 stays
+  above the threshold for several consecutive checks (not on one slow
+  request). `GET /alerts` exposes fired alerts.
+
+**Verified the alert actually fires, not just exists as config:**
+`tests/test_v0_7_slo_monitor.py` (3/3 passing) runs the real background
+monitor loop with a short check interval and asserts: (1) sustained slow
+latencies fire a real alert with a p99 above threshold, (2) healthy
+latencies never fire one, (3) a single slow request among otherwise
+healthy ones does *not* fire alone — sustained means sustained. Also fired
+for real against the live server: with `SLO_LATENCY_THRESHOLD_S=0.5` and
+two real ~1.8s requests, `/alerts` showed a fired alert with
+`p99_latency_s: 1.824` within 3 seconds of sending them.
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -319,5 +346,5 @@ python benchmarks/bench_v0.1_baseline.py
 - [x] v0.4 — quantization (Q4_0/Q8_0-style, PyTorch weight-only; see scope note)
 - [x] v0.5 — cancellation & resource lifecycle
 - [x] v0.6 — multi-model router
-- [ ] v0.7 — observability + SLO
+- [x] v0.7 — observability + SLO
 - [ ] v0.8 — comparison against vLLM

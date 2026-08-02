@@ -6,20 +6,25 @@ the two can be A/B benchmarked on the same running process.
 """
 import asyncio
 import os
+import time
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from server.engine import ContinuousBatchingEngine
+from server.metrics import ACTIVE_REQUESTS, POOL_FREE_BLOCKS, REQUEST_COUNT, REQUEST_LATENCY, TTFT, metrics_payload
 from server.model import Model
 from server.paged_engine import PagedKVCacheEngine
 from server.router import ModelRouter
+from server.slo_monitor import SLOMonitor
+from server.tracing import tracer
 
 app = FastAPI(title="metal-inference-server")
 model: Model | None = None
 engine: ContinuousBatchingEngine | None = None
 paged_engine: PagedKVCacheEngine | None = None
 router: ModelRouter | None = None
+slo_monitor: SLOMonitor | None = None
 _single_lock = asyncio.Lock()
 
 
@@ -36,7 +41,7 @@ class RoutedGenerateRequest(BaseModel):
 
 @app.on_event("startup")
 async def load_model():
-    global model, engine, paged_engine, router
+    global model, engine, paged_engine, router, slo_monitor
     model = Model()
     # 16 reliably wedges the MPS backend under concurrent load (see
     # docs/DESIGN_DECISIONS.md v0.2 entry) -- 4 is the safe measured default.
@@ -60,6 +65,19 @@ async def load_model():
         )
         router.start()
 
+    slo_monitor = SLOMonitor(
+        latency_threshold_s=float(os.environ.get("SLO_LATENCY_THRESHOLD_S", "8.0")),
+        check_interval_s=float(os.environ.get("SLO_CHECK_INTERVAL_S", "5.0")),
+        sustained_breaches=int(os.environ.get("SLO_SUSTAINED_BREACHES", "3")),
+        window_size=int(os.environ.get("SLO_WINDOW_SIZE", "20")),
+    )
+    slo_monitor.start()
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(content=metrics_payload(), media_type="text/plain; version=0.0.4")
+
 
 @app.get("/health")
 def health():
@@ -72,7 +90,13 @@ def health():
         "paged_pool_free_blocks": paged_engine.allocator.num_free if paged_engine else 0,
         "paged_pool_total_blocks": paged_engine.allocator.num_blocks if paged_engine else 0,
         "router": router.health() if router else None,
+        "slo_alerts_fired": len(slo_monitor.alerts_fired) if slo_monitor else 0,
     }
+
+
+@app.get("/alerts")
+def alerts():
+    return {"alerts": slo_monitor.alerts_fired if slo_monitor else []}
 
 
 @app.post("/generate")
@@ -105,27 +129,49 @@ async def generate_paged(req: GenerateRequest, request: Request):
         while not await request.is_disconnected():
             await asyncio.sleep(0.1)
 
-    gen_task = asyncio.ensure_future(paged_engine.submit(req.prompt, req.max_new_tokens))
-    disconnect_task = asyncio.ensure_future(_watch_disconnect())
-    done, pending = await asyncio.wait(
-        {gen_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
-    )
-
-    if gen_task in done:
-        disconnect_task.cancel()
+    ACTIVE_REQUESTS.labels(endpoint="generate_paged").inc()
+    t0 = time.perf_counter()
+    with tracer.start_as_current_span("generate_paged") as span:
+        span.set_attribute("prompt_len", len(req.prompt))
+        span.set_attribute("max_new_tokens", req.max_new_tokens)
         try:
-            return gen_task.result()
-        except RuntimeError as e:
-            raise HTTPException(status_code=503, detail=str(e))
+            gen_task = asyncio.ensure_future(paged_engine.submit(req.prompt, req.max_new_tokens))
+            disconnect_task = asyncio.ensure_future(_watch_disconnect())
+            done, pending = await asyncio.wait(
+                {gen_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
+            )
 
-    # client disconnected first -- cancel the in-flight generation so the
-    # engine frees its KV blocks instead of running to completion unseen
-    gen_task.cancel()
-    try:
-        await gen_task
-    except asyncio.CancelledError:
-        pass
-    return None
+            if gen_task in done:
+                disconnect_task.cancel()
+                try:
+                    result = gen_task.result()
+                except RuntimeError as e:
+                    REQUEST_COUNT.labels(endpoint="generate_paged", status="error").inc()
+                    raise HTTPException(status_code=503, detail=str(e))
+
+                elapsed = time.perf_counter() - t0
+                REQUEST_LATENCY.labels(endpoint="generate_paged").observe(elapsed)
+                if result.get("ttft_s") is not None:
+                    TTFT.labels(endpoint="generate_paged").observe(result["ttft_s"])
+                REQUEST_COUNT.labels(endpoint="generate_paged", status="ok").inc()
+                slo_monitor.record(elapsed)
+                span.set_attribute("new_tokens", result["new_tokens"])
+                span.set_attribute("elapsed_s", elapsed)
+                return result
+
+            # client disconnected first -- cancel the in-flight generation so
+            # the engine frees its KV blocks instead of running to completion unseen
+            gen_task.cancel()
+            try:
+                await gen_task
+            except asyncio.CancelledError:
+                pass
+            REQUEST_COUNT.labels(endpoint="generate_paged", status="cancelled").inc()
+            span.set_attribute("cancelled", True)
+            return None
+        finally:
+            ACTIVE_REQUESTS.labels(endpoint="generate_paged").dec()
+            POOL_FREE_BLOCKS.labels(engine="paged").set(paged_engine.allocator.num_free)
 
 
 @app.post("/generate_multi")
