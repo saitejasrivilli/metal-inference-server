@@ -5,8 +5,8 @@ Continuous-batching LLM inference server built from scratch for Apple Silicon
 natively. Every number below comes from an actual run on this machine
 (M-series Mac, macOS 15.5). No projected or estimated numbers.
 
-**Status: v0.1 baseline** — single request at a time, no batching. This is
-the control group every later milestone benchmarks against.
+**Status: v0.2 continuous batching** — dynamic queue + batch assembly, own
+code, benchmarked against the v0.1 baseline.
 
 ## Architecture (v0.1)
 
@@ -46,6 +46,55 @@ max_new_tokens=128, single request at a time, no batching).
   vs. ~39 tok/s on subsequent runs. This warmup cost is real and will matter
   for cold-start latency later; not hidden.
 
+## What's new in v0.2 — continuous batching
+
+`server/engine.py`: a request queue + dynamic batch assembly + decode loop,
+written from scratch (no off-the-shelf batching runtime targets MPS).
+Every decode step, active requests are left-padded into one tensor and
+advanced one token together; finished requests are evicted and new ones
+admitted from the queue on the next step — batch composition changes every
+step, which is what makes it "continuous" rather than fixed-batch.
+
+**Honest limitation (by design, not a bug):** v0.2 has no KV-cache reuse
+across steps yet. Each step recomputes the forward pass over every active
+sequence's full token history so far. That's the real ceiling on this
+milestone's throughput, not batch size — paged KV cache (v0.3) is what
+actually fixes it.
+
+**Honest negative result:** the first version of this milestone used
+`max_batch_size=16`. At concurrency 50+ it reliably wedged the PyTorch MPS
+backend — the process entered an uninterruptible-sleep state and stopped
+responding to any request, including `/health`, and required `kill -9` to
+recover. Reproduced twice. Root-caused to batch size, not concurrency:
+dropping to `max_batch_size=4` (`MAX_BATCH_SIZE` env var) made every run at
+concurrency 10/20/50/100/200 complete cleanly. This is left as-is rather
+than silently tuned away — it's a real constraint of running large batched
+tensor ops through the MPS backend under this workload, worth knowing before
+trusting Metal for serving at scale.
+
+### Benchmarks — batching (bs=4) vs. v0.1 single-request, same load
+
+Same prompt/settings as v0.1 (greedy decode, 32 max new tokens), varying
+concurrent requests. Raw JSON in `benchmarks/results/v0.2_*.json`.
+
+| Concurrency | Single-request throughput (tok/s) | Batched (bs=4) throughput (tok/s) | Batched speedup |
+|---|---|---|---|
+| 10 | 27.5 | 5.2* | 0.19x* |
+| 20 | 33.0 | 48.0 | 1.45x |
+| 50 | 28.9 | 45.9 | 1.59x |
+| 100 | n/a (not run) | 47.9 | — |
+| 200 | n/a (not run) | 43.9 | — |
+
+\* c=10 batched run measured immediately after server start and includes
+MPS kernel warmup (matches the same warmup effect seen in v0.1); not
+representative of steady state — see c=20/50 for the real comparison.
+
+At concurrency 20-50, continuous batching gives a real ~1.5x throughput
+improvement over one-request-at-a-time, using the same model, same
+hardware, same decode settings. It also holds up cleanly to c=200, which
+the single-request path was never going to do gracefully (unbounded queued
+connections, not tested at that scale for that reason).
+
 ## Design decisions
 
 See `docs/DESIGN_DECISIONS.md` (grows per milestone).
@@ -80,7 +129,7 @@ python benchmarks/bench_v0.1_baseline.py
 ## Roadmap
 
 - [x] v0.1 — baseline single-request server
-- [ ] v0.2 — continuous batching scheduler
+- [x] v0.2 — continuous batching scheduler
 - [ ] v0.3 — paged KV cache
 - [ ] v0.4 — quantization (GGUF Q4_0/Q8_0)
 - [ ] v0.5 — cancellation & resource lifecycle
