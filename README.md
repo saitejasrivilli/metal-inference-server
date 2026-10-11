@@ -29,7 +29,7 @@ fire in tests. vLLM couldn't be run locally (no CUDA on this machine,
 and vLLM has no Apple Silicon support) — that limitation, and a citation
 to public vLLM numbers, are stated plainly rather than glossed over.
 
-## Architecture (current, v0.8)
+## Architecture (v0.8 baseline; v0.9 adds SSE streaming)
 
 ```
                                    /generate          -> v0.1 single-request path (control group)
